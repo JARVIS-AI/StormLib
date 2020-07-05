@@ -89,7 +89,7 @@ static bool BaseFile_Create(TFileStream * pStream)
     }
 #endif
 
-#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX)
+#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX) || defined(PLATFORM_HAIKU)
     {
         intptr_t handle;
         
@@ -138,7 +138,7 @@ static bool BaseFile_Open(TFileStream * pStream, const TCHAR * szFileName, DWORD
     }
 #endif
 
-#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX)
+#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX) || defined(PLATFORM_HAIKU)
     {
         struct stat64 fileinfo;
         int oflag = (dwStreamFlags & STREAM_FLAG_READ_ONLY) ? O_RDONLY : O_RDWR;
@@ -207,7 +207,7 @@ static bool BaseFile_Read(
     }
 #endif
 
-#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX)
+#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX) || defined(PLATFORM_HAIKU)
     {
         ssize_t bytes_read;
 
@@ -278,7 +278,7 @@ static bool BaseFile_Write(TFileStream * pStream, ULONGLONG * pByteOffset, const
     }
 #endif
 
-#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX)
+#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX) || defined(PLATFORM_HAIKU)
     {
         ssize_t bytes_written;
 
@@ -345,7 +345,7 @@ static bool BaseFile_Resize(TFileStream * pStream, ULONGLONG NewFileSize)
     }
 #endif
     
-#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX)
+#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX) || defined(PLATFORM_HAIKU)
     {
         if(ftruncate64((intptr_t)pStream->Base.File.hFile, (off64_t)NewFileSize) == -1)
         {
@@ -389,7 +389,7 @@ static bool BaseFile_Replace(TFileStream * pStream, TFileStream * pNewStream)
     return (bool)MoveFile(pNewStream->szFileName, pStream->szFileName);
 #endif
 
-#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX)
+#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX) || defined(PLATFORM_HAIKU)
     // "rename" on Linux also works if the target file exists
     if(rename(pNewStream->szFileName, pStream->szFileName) == -1)
     {
@@ -409,7 +409,7 @@ static void BaseFile_Close(TFileStream * pStream)
         CloseHandle(pStream->Base.File.hFile);
 #endif
 
-#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX)
+#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX) || defined(PLATFORM_HAIKU)
         close((intptr_t)pStream->Base.File.hFile);
 #endif
     }
@@ -434,53 +434,113 @@ static void BaseFile_Init(TFileStream * pStream)
 //-----------------------------------------------------------------------------
 // Local functions - base memory-mapped file support
 
-static bool BaseMap_Open(TFileStream * pStream, const TCHAR * szFileName, DWORD dwStreamFlags)
+#ifdef PLATFORM_WINDOWS
+
+typedef struct _SECTION_BASIC_INFORMATION
+{
+    PVOID BaseAddress;
+    ULONG Attributes;
+    LARGE_INTEGER Size;
+} SECTION_BASIC_INFORMATION, *PSECTION_BASIC_INFORMATION;
+
+typedef ULONG (WINAPI * NTQUERYSECTION)(
+    IN  HANDLE SectionHandle,
+    IN  ULONG SectionInformationClass,
+    OUT PVOID SectionInformation,
+    IN  SIZE_T Length,
+    OUT PSIZE_T ResultLength);
+
+static bool RetrieveFileMappingSize(HANDLE hSection, ULARGE_INTEGER & RefFileSize)
+{
+    SECTION_BASIC_INFORMATION BasicInfo = {0};
+    NTQUERYSECTION PfnQuerySection;
+    HMODULE hNtdll;
+    SIZE_T ReturnLength = 0;
+    
+    if((hNtdll = GetModuleHandle(_T("ntdll.dll"))) != NULL)
+    {
+        PfnQuerySection = (NTQUERYSECTION)GetProcAddress(hNtdll, "NtQuerySection");
+        if(PfnQuerySection != NULL)
+        {
+            if(PfnQuerySection(hSection, 0, &BasicInfo, sizeof(SECTION_BASIC_INFORMATION), &ReturnLength) == 0)
+            {
+                RefFileSize.HighPart = BasicInfo.Size.HighPart;
+                RefFileSize.LowPart = BasicInfo.Size.LowPart;
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+#endif
+
+static bool BaseMap_Open(TFileStream * pStream, LPCTSTR szFileName, DWORD dwStreamFlags)
 {
 #ifdef PLATFORM_WINDOWS
 
-    ULARGE_INTEGER FileSize;
-    HANDLE hFile;
-    HANDLE hMap;
+    ULARGE_INTEGER FileSize = {0};
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMap = NULL;
     bool bResult = false;
 
     // Keep compiler happy
     dwStreamFlags = dwStreamFlags;
 
-    // Open the file for read access
-    hFile = CreateFile(szFileName, FILE_READ_DATA, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if(hFile != INVALID_HANDLE_VALUE)
+    // 1) Try to treat "szFileName" as a section name
+    hMap = OpenFileMapping(SECTION_QUERY | FILE_MAP_READ, FALSE, szFileName);
+    if(hMap != NULL)
     {
-        // Retrieve file size. Don't allow mapping file of a zero size.
-        FileSize.LowPart = GetFileSize(hFile, &FileSize.HighPart);
-        if(FileSize.QuadPart != 0)
+        // Try to retrieve the size of the mapping
+        if(!RetrieveFileMappingSize(hMap, FileSize))
         {
-            // Now create mapping object
-            hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-            if(hMap != NULL)
+            CloseHandle(hMap);
+            hMap = NULL;
+        }
+    }
+
+    // 2) Treat the name as file name
+    else
+    {
+        hFile = CreateFile(szFileName, FILE_READ_DATA, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+        if(hFile != INVALID_HANDLE_VALUE)
+        {
+            // Retrieve file size. Don't allow mapping file of a zero size.
+            FileSize.LowPart = GetFileSize(hFile, &FileSize.HighPart);
+            if(FileSize.QuadPart != 0)
             {
-                // Map the entire view into memory
-                // Note that this operation will fail if the file can't fit
-                // into usermode address space
-                pStream->Base.Map.pbFile = (LPBYTE)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-                if(pStream->Base.Map.pbFile != NULL)
-                {
-                    // Retrieve file time
-                    GetFileTime(hFile, NULL, NULL, (LPFILETIME)&pStream->Base.Map.FileTime);
-
-                    // Retrieve file size and position
-                    pStream->Base.Map.FileSize = FileSize.QuadPart;
-                    pStream->Base.Map.FilePos = 0;
-                    bResult = true;
-                }
-
-                // Close the map handle
-                CloseHandle(hMap);
+                // Now create file mapping over the file
+                hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
             }
         }
-
-        // Close the file handle
-        CloseHandle(hFile);
     }
+
+    // Did it succeed?
+    if(hMap != NULL)
+    {
+        // Map the entire view into memory
+        // Note that this operation will fail if the file can't fit
+        // into usermode address space
+        pStream->Base.Map.pbFile = (LPBYTE)MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if(pStream->Base.Map.pbFile != NULL)
+        {
+            // Retrieve file time. If it's named section, put 0
+            if(hFile != INVALID_HANDLE_VALUE)
+                GetFileTime(hFile, NULL, NULL, (LPFILETIME)&pStream->Base.Map.FileTime);
+
+            // Retrieve file size and position
+            pStream->Base.Map.FileSize = FileSize.QuadPart;
+            pStream->Base.Map.FilePos = 0;
+            bResult = true;
+        }
+
+        // Close the map handle
+        CloseHandle(hMap);
+    }
+
+    // Close the file handle
+    if(hFile != INVALID_HANDLE_VALUE)
+        CloseHandle(hFile);
 
     // If the file is not there and is not available for random access,
     // report error
@@ -488,7 +548,7 @@ static bool BaseMap_Open(TFileStream * pStream, const TCHAR * szFileName, DWORD 
         return false;
 #endif
 
-#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX)
+#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX) || defined(PLATFORM_HAIKU)
     struct stat64 fileinfo;
     intptr_t handle;
     bool bResult = false;
@@ -557,7 +617,7 @@ static void BaseMap_Close(TFileStream * pStream)
         UnmapViewOfFile(pStream->Base.Map.pbFile);
 #endif
 
-#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX)
+#if defined(PLATFORM_MAC) || defined(PLATFORM_LINUX) || defined(PLATFORM_HAIKU)
     if(pStream->Base.Map.pbFile != NULL)
         munmap(pStream->Base.Map.pbFile, (size_t )pStream->Base.Map.FileSize);
 #endif
